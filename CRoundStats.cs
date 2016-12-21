@@ -24,6 +24,7 @@ using System.Windows.Forms;
 using System.CodeDom.Compiler;
 using Microsoft.CSharp;
 using System.Linq;
+using System.Xml.Serialization;
 
 namespace PRoConEvents
 {
@@ -34,10 +35,35 @@ namespace PRoConEvents
     /// <returns></returns>
     public delegate String HTMLDecode(String encoded);
 
+    public class StatEntry
+    {
+        public Stats stats { get; set; }
+    }
+    public class StatsLog
+    {
+        public int Round { get; set; }
+        [XmlIgnore]
+        public DateTime LoggingTime { get; set; }
+        [XmlElement("LoggingTime")]
+        public string LoggingTimeString
+        {
+            get { return this.LoggingTime.ToString("yyyy-MM-dd HH:mm:ss"); }
+            set { this.LoggingTime = DateTime.Parse(value); }
+        }
+
+        public List<StatEntry> StatEntries { get; set; }
+
+        public StatsLog()
+        {
+            StatEntries = new List<StatEntry>();
+        }
+    }
+
     public class CRoundStats : PRoConPluginAPI, IPRoConPluginInterface
     {
         private bool fIsEnabled;
         private int fDebugLevel;
+        private bool fLogging;
 
         public String server_host = String.Empty;
         public String server_port = String.Empty;
@@ -50,13 +76,24 @@ namespace PRoConEvents
         private Dictionary<string, Stats> PlayerStats = new Dictionary<string, Stats>();
         private Dictionary<string, Stats> PlayerStatsEnd = new Dictionary<string, Stats>();
         private List<Stats> LastRoundStats = new List<Stats>();
+        private string log_path;
+        public List<StatsLog> statlog = new List<StatsLog>();
 
-        static readonly string[,] statsMatches = new string[,]
+        /// <summary>
+        /// Index 0 - Variable name (Keep unchanged)
+        /// Index 1 - Command string (For chat stats)
+        /// Index 2 - Action
+        /// Index 3 - Category
+        /// Index 4 - Message (Message for chat stats)
+        /// </summary>
+        static readonly string[,] statsMatches = new string[,] 
         {
                     { "heals", "heal", "Heals", "Healer", "%soldier% did %value% Heals in the last round." },
                     { "revives", "revive", "Revives", "Reviver", "%soldier% did %value% Revives in the last round."},
                     { "repairs", "repair", "Repairs", "Repairer", "%soldier% did %value% Repairs in the last round." },
-                    { "resupplies", "resupply", "Resupplies", "Resupplier", "%soldier% did %value% Resupplies in the last round." }
+                    { "resupplies", "resupply", "Resupplies", "Resupplier", "%soldier% did %value% Resupplies in the last round." },
+                    { "vehicleDamage", "vdamage", "Vehicles Damaged", "Vehicle Damager", "%soldier% damaged %value% Vehicles in the last round." },
+                    { "vehiclesDestroyed", "vdestroys", "Vehicles Destroyed", "Vehicle Destroyer", "%soldier% destroyed %value% Vehicles in the last round." }
         };
         DataContainer statsContainer = new DataContainer(statsMatches);
 
@@ -66,6 +103,7 @@ namespace PRoConEvents
         {
             fIsEnabled = false;
             fDebugLevel = 2;
+            fLogging = false;
         }
 
         #region Helpers
@@ -73,7 +111,7 @@ namespace PRoConEvents
 
         public String FormatMessage(String msg, MessageType type)
         {
-            String prefix = "[^bDebug Logging^n] ";
+            String prefix = "[^b" + GetPluginName() + "^n] ";
 
             if (type.Equals(MessageType.Warning))
                 prefix += "^1^bWARNING^0^n: ";
@@ -132,7 +170,7 @@ namespace PRoConEvents
         }
         public string GetPluginVersion()
         {
-            return "0.0.0.1";
+            return "0.0.0.2";
         }
         public string GetPluginAuthor()
         {
@@ -140,7 +178,7 @@ namespace PRoConEvents
         }
         public string GetPluginWebsite()
         {
-            return "github.com/Razer2015";
+            return "github.com/Razer2015/Round-Stats";
         }
         public string GetPluginDescription()
         {
@@ -157,6 +195,11 @@ namespace PRoConEvents
 <p>Developed by xfileFIN</p>
 
 <h3>Changelog</h3>
+<blockquote><h4>0.0.0.2 (21.12.2016)</h4>
+	- Added: Vehicle damage and Vehicles Destroyed<br/>
+	- Added: Logging capabilites<br/>
+	- Fixed: Bug showing resupplies in repairs block<br/>
+	- TODO: Add some kind of print functions for the log file<br/>
 <blockquote><h4>0.0.0.1 (11.12.2016)</h4>
 	- initial version<br/>
 </blockquote>
@@ -169,7 +212,20 @@ namespace PRoConEvents
         {
             List<CPluginVariable> lstReturn = new List<CPluginVariable>();
 
-            lstReturn.Add(new CPluginVariable("Debug|Debug level", fDebugLevel.GetType(), fDebugLevel));
+            lstReturn.Add(new CPluginVariable("1.0 Debug|Debug level", fDebugLevel.GetType(), fDebugLevel));
+
+            string category = "";
+            for (int i = 0; i < statsMatches.GetLength(0); i++)
+            {
+                for (int j = 1; j < statsMatches.GetLength(1); j++)
+                {
+                    category = statsMatches[i, 2];
+                    lstReturn.Add(new CPluginVariable(String.Format("3.{2:00} Messages - {0}|Message [{2},{3}] - {0} - {1}", 
+                        category, (DataContainer.Categories)j, i, j), typeof(string), statsMatches[i, j]));
+                }
+            }
+
+            lstReturn.Add(new CPluginVariable("2.0 Logging|Logging Enabled", fLogging.GetType(), fLogging));
 
             return lstReturn;
         }
@@ -186,6 +242,31 @@ namespace PRoConEvents
                 int.TryParse(strValue, out tmp);
                 fDebugLevel = tmp;
             }
+            else if(strVariable.Contains("Message ["))
+            {
+                var match = Regex.Match(strVariable, @"\[(.*?)\]");
+                if (match.Success)
+                {
+                    string[] numbers = Regex.Split(match.Value, @"\D+").Where(x => !string.IsNullOrEmpty(x)).ToArray();
+                    if (numbers.Length < 2)
+                        return;
+                    try
+                    {
+                        statsMatches[int.Parse(numbers[0]), int.Parse(numbers[1])] = strValue;
+                        statsContainer.Refresh(statsMatches);
+                    }
+                    catch (Exception e)
+                    {
+                        DebugWrite(e.ToString(), 5);
+                    }
+                }
+            }
+            else if (Regex.Match(strVariable, @"Logging Enabled").Success)
+            {
+                bool tmp = false;
+                bool.TryParse(strValue, out tmp);
+                fLogging = tmp;
+            }
         }
         #endregion
 
@@ -194,12 +275,15 @@ namespace PRoConEvents
         {
             server_host = strHostName;
             server_port = strPort;
+            log_path = makeRelativePath(String.Format("{0}_{1}_{2}_statslog.xml", this.GetType().Name, server_host, server_port));
+            LoadStatsLog();
             this.RegisterEvents(this.GetType().Name, "OnListPlayers", "OnPlayerLeft", "OnPlayerKilled", "OnPlayerSpawned", "OnGlobalChat", "OnTeamChat", "OnSquadChat", "OnPlayerChat", "OnRoundOverPlayers", "OnRoundOver", "OnLevelLoaded", "OnLevelStarted");
         }
 
         public void OnPluginEnable()
         {
             fIsEnabled = true;
+            LoadStatsLog();
             ConsoleWrite("^2Enabled!");
         }
         public void OnPluginDisable()
@@ -274,6 +358,18 @@ namespace PRoConEvents
                     foreach (var player in PlayerStats) // Compare
                         if (PlayerStatsEnd.ContainsKey(player.Key))
                             LastRoundStats.Add(StatsParser.Compare(player.Value, PlayerStatsEnd[player.Key]));
+
+                    // Logging
+                    if (fLogging)
+                    {
+                        List<StatEntry> statentries = new List<StatEntry>();
+                        DateTime dateNow = DateTime.UtcNow;
+                        foreach (var stat in LastRoundStats)
+                            statentries.Add(new StatEntry() { stats = stat });
+
+                        statlog.Add(new StatsLog() { Round = (statlog.Count > 0) ? (statlog[(statlog.Count - 1)].Round + 1) : 0, StatEntries = statentries, LoggingTime = dateNow });
+                        SaveStatsLog();
+                    }
                 }
                 catch (Exception e)
                 {
@@ -294,11 +390,13 @@ namespace PRoConEvents
             var mostRevives = LastRoundStats.OrderByDescending(i => i.revives).FirstOrDefault();
             var mostResupplies = LastRoundStats.OrderByDescending(i => i.resupplies).FirstOrDefault();
             var mostRepairs = LastRoundStats.OrderByDescending(i => i.repairs).FirstOrDefault();
+            var mostDestroys = LastRoundStats.OrderByDescending(i => i.vehiclesDestroyed).FirstOrDefault();
 
             if (!mostHeals.Equals(default(Stats)) && mostHeals.heals > 0
                 || !mostRevives.Equals(default(Stats)) && mostRevives.revives > 0
                 || !mostResupplies.Equals(default(Stats)) && mostResupplies.resupplies > 0
-                || !mostRepairs.Equals(default(Stats)) && mostRepairs.repairs > 0)
+                || !mostRepairs.Equals(default(Stats)) && mostRepairs.repairs > 0
+                || !mostDestroys.Equals(default(Stats)) && mostDestroys.vehiclesDestroyed > 0)
                 ServerCommand("admin.say", "-- Best Team Players (experimental) --", "all");
             if (!mostHeals.Equals(default(Stats)) && mostHeals.heals > 0)
                 ServerCommand("admin.say", String.Format("-- Healer: {0} with {1} heals --", mostHeals.soldierName, mostHeals.heals), "all");
@@ -307,7 +405,9 @@ namespace PRoConEvents
             if (!mostResupplies.Equals(default(Stats)) && mostResupplies.resupplies > 0)
                 ServerCommand("admin.say", String.Format("-- Resupplier: {0} with {1} resupplies --", mostResupplies.soldierName, mostResupplies.resupplies), "all");
             if (!mostRepairs.Equals(default(Stats)) && mostRepairs.repairs > 0)
-                ServerCommand("admin.say", String.Format("-- Repairer: {0} with {1} repairs --", mostRepairs.soldierName, mostRepairs.resupplies), "all");
+                ServerCommand("admin.say", String.Format("-- Repairer: {0} with {1} repairs --", mostRepairs.soldierName, mostRepairs.repairs), "all");
+            if (!mostDestroys.Equals(default(Stats)) && mostDestroys.vehiclesDestroyed > 0)
+                ServerCommand("admin.say", String.Format("-- Destroyer: {0} with {1} vehicles destroyed --", mostDestroys.soldierName, mostDestroys.vehiclesDestroyed), "all");
 
             PlayerStats.Clear();
             ServerCommand("listPlayers", "all");
@@ -318,6 +418,27 @@ namespace PRoConEvents
             ServerCommand("listPlayers", "all");
         }
         #endregion
+
+        private void LoadStatsLog()
+        {
+            if (File.Exists(log_path))
+            {
+                XmlSerializer deserializer = new XmlSerializer(typeof(List<StatsLog>));
+                TextReader reader = new StreamReader(log_path);
+                object obj = deserializer.Deserialize(reader);
+                statlog = (List<StatsLog>)obj;
+                reader.Close();
+            }
+        }
+
+        private void SaveStatsLog()
+        {
+            XmlSerializer serializer = new XmlSerializer(typeof(List<StatsLog>));
+            using (TextWriter writer = new StreamWriter(log_path))
+            {
+                serializer.Serialize(writer, statlog);
+            }
+        }
 
         private void RefreshStats(string soldierName, ref Dictionary<string, Stats> Stats, bool forceFetch)
         {
@@ -457,6 +578,16 @@ namespace PRoConEvents
         {
             return src.GetType().GetProperty(propName).GetValue(src, null);
         }
+
+        public String makeRelativePath(String file)
+        {
+            String exe_path = Directory.GetParent(Application.ExecutablePath).FullName;
+            String dll_path = Directory.GetParent(Assembly.GetExecutingAssembly().Location).FullName;
+
+            String rel_path = dll_path.Replace(exe_path, "");
+            rel_path = Path.Combine(rel_path.Trim(new char[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }), file);
+            return rel_path;
+        }
     } // end CRoundStats
 
     public static class StatsParser
@@ -577,12 +708,18 @@ namespace PRoConEvents
             MESSAGE
         }
 
-        private readonly string[,] _data;
+        private string[,] _data;
         private List<string> _index;
 
         public DataContainer(string[,] data)
         {
             _data = data;
+        }
+
+        public void Refresh(string[,] data)
+        {
+            _data = data;
+            _index = null;
         }
 
         public bool Contains(string value)
@@ -609,7 +746,7 @@ namespace PRoConEvents
         /// <returns></returns>
         public string GetIndex(string value, Categories index)
         {
-            return (GetIndex(value, int.Parse(index.ToString())));
+            return (GetIndex(value, (int)index));
         }
 
         /// <summary>
